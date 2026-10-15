@@ -12,5 +12,3 @@ Game names are looked up locally by Title ID in the database bundled at `romfs:/
 If future dates are found, the app displays the game name and its first- and last-played dates. Use **left/right** to select the year, month, or day for each date, and **up/down** to change the selected value. Press **A** to save or **B** to cancel. The JSON file is created only after all future dates have been corrected. Corrections are saved to `/3ds/PhalkProfiles/date_corrections.txt`; the NAND Activity Log is not modified. Corrections made in the previous screen must be saved again.
 
 Use **up/down** to navigate, **A** to select, and **START** to exit.
-
-**Warning:** uploads use unencrypted HTTP. Your password and activity history are transmitted over the network without protection.
