@@ -7,7 +7,7 @@
 
 The generated file is saved to `/3ds/PhalkProfiles/export.json`.
 
-Choose **Update Activity Log (Last update: …)** before uploading. The app records the request date and time, then tries to open the built-in Activity Log. Recent sessions may not be written to the saved `pld.dat` until Activity Log is opened. If your Homebrew setup cannot launch it directly, open Activity Log manually and relaunch PhalkProfiles-3DS.
+Before uploading, choose the first menu option, **Update Activity Log**. The app records the request time and tries to open Activity Log; the 3DS saves recent sessions there when it opens. Return to PhalkProfiles-3DS and choose **Create and upload**. If Activity Log does not open directly, open it manually and relaunch the app.
 
 Game names are looked up locally by Title ID in the database bundled at `romfs:/3ds_db.json`. The matched name is also written to the `name` field in `export.json`.
 
