@@ -5,7 +5,7 @@
 3. Select **Set username** and **Set password** to enter your Phalk Profiles account credentials.
 4. Select **Create JSON** to save your activity history to the SD card, or **Create and upload** to save it and upload it to the website. Connect your 3DS to Wi-Fi to upload.
 
-The generated file is saved to `/3ds/PhalkProfiles/export.json`. The app reads the Activity Log directly from the 3DS; Activity Log++ is not required.
+The generated file is saved to `/3ds/PhalkProfiles/export.json`.
 
 Game names are looked up locally by Title ID in the database bundled at `romfs:/3ds_db.json`. The matched name is also written to the `name` field in `export.json`.
 
