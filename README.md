@@ -7,7 +7,7 @@
 
 The generated file is saved to `/3ds/PhalkProfiles/export.json`.
 
-For the latest play sessions, open the built-in Activity Log once before launching this app. The 3DS may keep recent sessions out of its saved `pld.dat` until Activity Log is opened.
+The app shows when the built-in Activity Log was last opened. Choose **Update Activity Log (Last update: …)** to open it before exporting; if your Homebrew setup cannot launch it directly, open Activity Log manually and relaunch PhalkProfiles-3DS. The 3DS may keep recent sessions out of its saved `pld.dat` until Activity Log is opened.
 
 Game names are looked up locally by Title ID in the database bundled at `romfs:/3ds_db.json`. The matched name is also written to the `name` field in `export.json`.
 

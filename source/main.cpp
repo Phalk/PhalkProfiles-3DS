@@ -489,15 +489,23 @@ bool askText(const char* hint, bool password, std::string& output) {
     return true;
 }
 
-void draw(const Config& config, const std::string& status, int selected) {
+void draw(const Config& config, const std::string& status, int selected,
+          const ActivityLogInfo& activityLogInfo) {
     consoleClear();
     std::printf("PHALK PROFILES - NINTENDO 3DS\n");
     std::printf("--------------------------------\n\n");
     std::printf("Account: %.26s\n", config.username.empty() ? "(not set)" : config.username.c_str());
-    std::printf("Password: %s\n\n", config.password.empty() ? "(not set)" : "********");
+    std::printf("Password: %s\n", config.password.empty() ? "(not set)" : "********");
+    const std::string lastOpened = formatActivityLogLastOpened(activityLogInfo);
+    std::printf("Activity Log last opened: %s\n", lastOpened.c_str());
+    std::printf("Open it before exporting to refresh sessions.\n\n");
 
-    const char* actions[] = {"Create JSON", "Create and upload", "Set username", "Set password", "Exit"};
-    for (int i = 0; i < 5; ++i) std::printf(" %c %s\n", i == selected ? '>' : ' ', actions[i]);
+    const std::string updateAction = std::string("Update Activity Log (Last update: ") +
+        (activityLogInfo.lastOpenedKnown ? lastOpened.substr(0, 10) : "unknown") + ")";
+    const std::string actions[] = {"Create JSON", "Create and upload", "Set username", "Set password",
+                                   updateAction, "Exit"};
+    for (int i = 0; i < 6; ++i)
+        std::printf(" %c %s\n", i == selected ? '>' : ' ', actions[i].c_str());
     std::printf("\nStatus:\n");
     for (size_t start = 0; start < status.size() && start < 175; start += 35)
         std::printf("%.*s\n", 35, status.c_str() + start);
@@ -516,19 +524,33 @@ int main() {
     Config config = loadConfig();
     std::string status = R_FAILED(fsResult) ? "File system init failed"
         : (R_SUCCEEDED(romfsResult) ? "Ready" : "Game database unavailable");
+    const ActivityLogInfo activityLogInfo = readActivityLogInfo();
     int selected = 0;
     bool dirty = true;
+    bool openActivityLog = false;
 
     while (aptMainLoop()) {
         hidScanInput();
         u32 down = hidKeysDown();
         if (down & KEY_START) break;
-        if (down & KEY_UP) { selected = (selected + 4) % 5; dirty = true; }
-        if (down & KEY_DOWN) { selected = (selected + 1) % 5; dirty = true; }
+        if (down & KEY_UP) { selected = (selected + 5) % 6; dirty = true; }
+        if (down & KEY_DOWN) { selected = (selected + 1) % 6; dirty = true; }
 
         if (down & KEY_A) {
-            if (selected == 4) break;
-            if (selected == 2 || selected == 3) {
+            if (selected == 5) break;
+            if (selected == 4) {
+                const u64 titleId = activityLogInfo.titleId != 0
+                    ? activityLogInfo.titleId : activityLogTitleIdForSystemRegion();
+                if (titleId == 0) {
+                    status = "Could not identify the system region";
+                } else {
+                    status = "Opening Activity Log...";
+                    draw(config, status, selected, activityLogInfo);
+                    presentFrame();
+                    openActivityLog = true;
+                    break;
+                }
+            } else if (selected == 2 || selected == 3) {
                 std::string value;
                 if (askText(selected == 2 ? "Phalk username" : "Phalk password", selected == 3, value)) {
                     if (selected == 2) config.username = value;
@@ -538,14 +560,14 @@ int main() {
             } else {
                 unsigned int count = 0;
                 status = "Reading Activity Log...";
-                draw(config, status, selected);
+                draw(config, status, selected, activityLogInfo);
                 presentFrame();
                 std::string error;
                 if (R_SUCCEEDED(fsResult) && R_SUCCEEDED(romfsResult) && prepareValidatedExport(count, error)) {
                     status = "JSON created: " + std::to_string(count) + " titles";
                     if (selected == 1) {
                         status = "Uploading via HTTP...";
-                        draw(config, status, selected);
+                        draw(config, status, selected, activityLogInfo);
                         presentFrame();
                         status = uploadExport(config, error) ? "Upload complete (HTTP 200)" : error;
                     }
@@ -556,9 +578,13 @@ int main() {
             }
             dirty = true;
         }
-        if (dirty) { draw(config, status, selected); dirty = false; }
+        if (dirty) { draw(config, status, selected, activityLogInfo); dirty = false; }
         presentFrame();
     }
+    if (openActivityLog)
+        aptSetChainloader(activityLogInfo.titleId != 0
+                              ? activityLogInfo.titleId : activityLogTitleIdForSystemRegion(),
+                          MEDIATYPE_NAND);
     if (R_SUCCEEDED(romfsResult)) romfsExit();
     if (R_SUCCEEDED(fsResult)) fsExit();
     gfxExit();

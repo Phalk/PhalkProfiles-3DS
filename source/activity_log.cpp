@@ -1,5 +1,7 @@
 #include "activity_log.hpp"
 #include <nlohmann/json.hpp>
+#include <3ds/services/cfgu.h>
+#include <3ds/services/ptmplays.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -17,6 +19,14 @@ const u32 kSummaryOffset = 0xC3510;
 const size_t kSummaryCount = 256;
 const size_t kSessionChunkCount = 256;
 const char* const kTitleDatabasePath = "romfs:/3ds_db.json";
+const u64 kActivityLogTitleIds[] = {
+    0x0004001000020200ULL, // Japan
+    0x0004001000021200ULL, // USA
+    0x0004001000022200ULL, // Europe / Australia
+    0x0004001000026200ULL, // China
+    0x0004001000027200ULL, // Korea
+    0x0004001000025200ULL  // Taiwan
+};
 
 struct PldSession {
     u64 id;
@@ -68,6 +78,12 @@ std::string hexCode(Result code) {
     char text[16];
     std::snprintf(text, sizeof(text), "0x%08lX", static_cast<unsigned long>(code));
     return text;
+}
+
+bool isActivityLogTitle(u64 id) {
+    for (size_t i = 0; i < sizeof(kActivityLogTitleIds) / sizeof(kActivityLogTitleIds[0]); ++i)
+        if (id == kActivityLogTitleIds[i]) return true;
+    return false;
 }
 
 // A successful archive open alone does not guarantee the save contains pld.dat.
@@ -140,6 +156,85 @@ bool readSummaries(PldSummary* summaries, u16* latestSessionDays,
 }
 
 } // namespace
+
+ActivityLogInfo readActivityLogInfo() {
+    ActivityLogInfo info = {0, activityLogTitleIdForSystemRegion(), false};
+    if (R_FAILED(ptmPlaysInit())) return info;
+
+    s32 startIndex = 0;
+    s32 eventCount = 0;
+    Result rc = PTMPLAYS_GetPlayHistoryStart(&startIndex);
+    if (R_SUCCEEDED(rc)) rc = PTMPLAYS_GetPlayHistorySize(&eventCount);
+    while (R_SUCCEEDED(rc) && eventCount > 0) {
+        const s32 count = std::min<s32>(64, eventCount);
+        const s32 offset = eventCount - count;
+        s32 queryStart = 0;
+        rc = PTMPLAYS_CalcPlayHistoryStart(&queryStart, startIndex, offset);
+        if (R_FAILED(rc)) break;
+
+        PtmPlayEvent events[64];
+        s32 endIndex = 0;
+        rc = PTMPLAYS_GetPlayHistory(&endIndex, events, queryStart, count);
+        if (R_FAILED(rc)) break;
+        for (s32 i = count - 1; i >= 0; --i) {
+            const u64 id = ptmGetPlayEventTitleId(events[i]);
+            if (events[i].type != PTMPLAYEVENT_APPLICATION_LAUNCH || !isActivityLogTitle(id))
+                continue;
+            info.lastOpenedMinutes = events[i].minutesSince2000;
+            info.titleId = id;
+            info.lastOpenedKnown = info.lastOpenedMinutes != 0;
+            break;
+        }
+        if (info.lastOpenedKnown) break;
+        eventCount = offset;
+    }
+
+    ptmPlaysExit();
+    return info;
+}
+
+std::string formatActivityLogLastOpened(const ActivityLogInfo& info) {
+    if (!info.lastOpenedKnown) return "unknown";
+    u32 days = info.lastOpenedMinutes / 1440;
+    const u32 minutes = info.lastOpenedMinutes % 1440;
+    int year = 2000;
+    while (days >= static_cast<u32>(365 + ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0))) {
+        days -= 365 + ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0);
+        ++year;
+    }
+    int month = 1;
+    while (true) {
+        const int length = month == 2
+            ? 28 + ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)
+            : (month == 4 || month == 6 || month == 9 || month == 11 ? 30 : 31);
+        if (days < static_cast<u32>(length)) break;
+        days -= length;
+        ++month;
+    }
+    char text[32];
+    std::snprintf(text, sizeof(text), "%04d-%02d-%02u %02u:%02u", year, month,
+                  static_cast<unsigned int>(days + 1), static_cast<unsigned int>(minutes / 60),
+                  static_cast<unsigned int>(minutes % 60));
+    return text;
+}
+
+u64 activityLogTitleIdForSystemRegion() {
+    if (R_FAILED(cfguInit())) return 0;
+    u8 region = 0xFF;
+    const Result rc = CFGU_SecureInfoGetRegion(&region);
+    cfguExit();
+    if (R_FAILED(rc)) return 0;
+    switch (region) {
+        case CFG_REGION_JPN: return kActivityLogTitleIds[0];
+        case CFG_REGION_USA: return kActivityLogTitleIds[1];
+        case CFG_REGION_EUR:
+        case CFG_REGION_AUS: return kActivityLogTitleIds[2];
+        case CFG_REGION_CHN: return kActivityLogTitleIds[3];
+        case CFG_REGION_KOR: return kActivityLogTitleIds[4];
+        case CFG_REGION_TWN: return kActivityLogTitleIds[5];
+        default: return 0;
+    }
+}
 
 bool readActivityLog(std::vector<ActivityTitle>& titles, u32 todayDays, std::string& error) {
     titles.clear();
