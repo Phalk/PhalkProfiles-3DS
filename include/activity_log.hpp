@@ -15,16 +15,8 @@ struct ActivityTitle {
     u16 latestFutureSessionDays;  // Kept separate so stale future sessions do not mask newer play.
 };
 
-struct ActivityLogInfo {
-    u32 lastOpenedMinutes;
-    u64 titleId;
-    bool lastOpenedKnown;
-};
-
 // Reads the console's own Activity Log summary from NAND without modifying it.
 bool readActivityLog(std::vector<ActivityTitle>& titles, u32 todayDays, std::string& error);
-ActivityLogInfo readActivityLogInfo();
-std::string formatActivityLogLastOpened(const ActivityLogInfo& info);
 u64 activityLogTitleIdForSystemRegion();
 
 // Looks up a title name in the bundled RomFS database by its 3DS TitleID.

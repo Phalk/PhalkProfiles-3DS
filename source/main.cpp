@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -18,12 +19,14 @@ using nlohmann::json;
 namespace {
 
 const char* const kDirectory = "sdmc:/3ds/PhalkProfiles";
-const char* const kConfig = "sdmc:/3ds/PhalkProfiles/config.txt";
+const char* const kDatabase = "sdmc:/3ds/PhalkProfiles/database.txt";
+const char* const kLegacyConfig = "sdmc:/3ds/PhalkProfiles/config.txt";
 const char* const kExport = "sdmc:/3ds/PhalkProfiles/export.json";
-const char* const kDateCorrections = "sdmc:/3ds/PhalkProfiles/date_corrections.txt";
+const char* const kLegacyDateCorrections = "sdmc:/3ds/PhalkProfiles/date_corrections.txt";
 const char* const kEndpoint = "http://www.phalk.net/profiles/json_curl.php";
 
 void ensureDirectory();
+bool saveDatabase();
 
 void presentFrame() {
     gfxFlushBuffers();
@@ -42,6 +45,14 @@ struct DateCorrection {
     u16 correctedFirst;
     u16 correctedLast;
 };
+
+struct AppDatabase {
+    Config config;
+    std::map<u64, std::vector<DateCorrection> > dateCorrections;
+    uint64_t lastActivityLogUpdate;
+};
+
+AppDatabase gDatabase = {{"", ""}, std::map<u64, std::vector<DateCorrection> >(), 0};
 
 struct EditableDate {
     int year;
@@ -98,6 +109,16 @@ bool currentActivityDay(u32& days, std::string& today) {
     return true;
 }
 
+std::string formatLastActivityLogUpdate() {
+    if (gDatabase.lastActivityLogUpdate == 0) return "unknown";
+    const std::time_t timestamp = static_cast<std::time_t>(gDatabase.lastActivityLogUpdate);
+    const std::tm* local = std::localtime(&timestamp);
+    if (!local) return "unknown";
+    char text[32];
+    if (std::strftime(text, sizeof(text), "%Y-%m-%d %H:%M", local) == 0) return "unknown";
+    return text;
+}
+
 bool futureDate(u16 days, u32 today) {
     return days != 0 && days != 0xFFFFu && days > today;
 }
@@ -127,30 +148,13 @@ void printEditableDate(const char* label, const EditableDate& date, int firstFie
 }
 
 void applyDateCorrections(std::vector<ActivityTitle>& records, u32 today) {
-    std::map<u64, std::vector<DateCorrection> > saved;
-    std::ifstream file(kDateCorrections);
-    std::string line;
-    while (std::getline(file, line)) {
-        // Recheck dates saved by the older automatic and keyboard-based editors.
-        if (line.size() < 3 || line[0] != 'E' || line[1] != ' ') continue;
-        unsigned long long id = 0;
-        unsigned int originalFirst = 0, originalLast = 0, correctedFirst = 0, correctedLast = 0;
-        char extra = 0;
-        if (std::sscanf(line.c_str() + 2, "%16llx %u %u %u %u %c", &id, &originalFirst,
-                        &originalLast, &correctedFirst, &correctedLast, &extra) != 5 ||
-            originalFirst > 0xFFFFu || originalLast > 0xFFFFu ||
-            correctedFirst > 0xFFFFu || correctedLast > 0xFFFFu) continue;
-        saved[static_cast<u64>(id)].push_back({static_cast<u16>(originalFirst),
-                                                static_cast<u16>(originalLast),
-                                                static_cast<u16>(correctedFirst),
-                                                static_cast<u16>(correctedLast)});
-    }
     for (ActivityTitle& entry : records) {
-        const std::map<u64, std::vector<DateCorrection> >::const_iterator found = saved.find(entry.id);
+        const std::map<u64, std::vector<DateCorrection> >::const_iterator found =
+            gDatabase.dateCorrections.find(entry.id);
         const u16 originalFirst = entry.firstPlayedDays;
         const u16 originalLast = entry.lastPlayedDays;
         bool lastCorrectionApplied = false;
-        if (found != saved.end()) {
+        if (found != gDatabase.dateCorrections.end()) {
             for (const DateCorrection& correction : found->second) {
                 if (originalFirst == correction.originalFirst)
                     entry.firstPlayedDays = correction.correctedFirst;
@@ -173,17 +177,13 @@ void applyDateCorrections(std::vector<ActivityTitle>& records, u32 today) {
 }
 
 bool saveDateCorrection(const ActivityTitle& original, const ActivityTitle& corrected) {
-    ensureDirectory();
-    std::ofstream file(kDateCorrections, std::ios::binary | std::ios::app);
-    if (!file) return false;
-    char line[80];
-    std::snprintf(line, sizeof(line), "E %016llX %u %u %u %u\n",
-                  static_cast<unsigned long long>(original.id), original.firstPlayedDays,
-                  original.lastPlayedDays, corrected.firstPlayedDays, corrected.lastPlayedDays);
-    file << '\n' << line;
-    file.flush();
-    file.close();
-    return !file.fail();
+    gDatabase.dateCorrections[original.id].push_back({original.firstPlayedDays,
+        original.lastPlayedDays, corrected.firstPlayedDays, corrected.lastPlayedDays});
+    if (saveDatabase()) return true;
+    std::vector<DateCorrection>& corrections = gDatabase.dateCorrections[original.id];
+    corrections.pop_back();
+    if (corrections.empty()) gDatabase.dateCorrections.erase(original.id);
+    return false;
 }
 
 bool reviewFutureDates(std::vector<ActivityTitle>& records, const std::vector<ActivityTitle>& original,
@@ -298,24 +298,147 @@ void trimCR(std::string& value) {
 }
 
 Config loadConfig() {
-    Config config;
-    std::ifstream file(kConfig);
-    if (!file) return config;
-    std::getline(file, config.username);
-    std::getline(file, config.password);
-    trimCR(config.username);
-    trimCR(config.password);
-    if (config.username.compare(0, 3, "\xef\xbb\xbf") == 0) config.username.erase(0, 3);
-    return config;
+    return gDatabase.config;
 }
 
 bool saveConfig(const Config& config) {
+    const Config previous = gDatabase.config;
+    gDatabase.config = config;
+    if (saveDatabase()) return true;
+    gDatabase.config = previous;
+    return false;
+}
+
+std::string encodeHex(const std::string& value) {
+    static const char digits[] = "0123456789ABCDEF";
+    std::string encoded;
+    encoded.reserve(value.size() * 2);
+    for (unsigned char byte : value) {
+        encoded.push_back(digits[byte >> 4]);
+        encoded.push_back(digits[byte & 0x0F]);
+    }
+    return encoded;
+}
+
+bool decodeHex(const std::string& encoded, std::string& value) {
+    if (encoded.size() % 2 != 0) return false;
+    value.clear();
+    value.reserve(encoded.size() / 2);
+    const std::string digits = "0123456789ABCDEF";
+    for (size_t i = 0; i < encoded.size(); i += 2) {
+        const size_t high = digits.find(static_cast<char>(std::toupper(static_cast<unsigned char>(encoded[i]))));
+        const size_t low = digits.find(static_cast<char>(std::toupper(static_cast<unsigned char>(encoded[i + 1]))));
+        if (high == std::string::npos || low == std::string::npos) {
+            value.clear();
+            return false;
+        }
+        value.push_back(static_cast<char>((high << 4) | low));
+    }
+    return true;
+}
+
+void addDateCorrection(const DateCorrection& correction, u64 id) {
+    std::vector<DateCorrection>& entries = gDatabase.dateCorrections[id];
+    for (const DateCorrection& entry : entries)
+        if (entry.originalFirst == correction.originalFirst &&
+            entry.originalLast == correction.originalLast &&
+            entry.correctedFirst == correction.correctedFirst &&
+            entry.correctedLast == correction.correctedLast) return;
+    entries.push_back(correction);
+}
+
+void loadLegacyDateCorrections() {
+    std::ifstream file(kLegacyDateCorrections);
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.size() < 3 || line[0] != 'E' || line[1] != ' ') continue;
+        unsigned long long id = 0;
+        unsigned int originalFirst = 0, originalLast = 0, correctedFirst = 0, correctedLast = 0;
+        char extra = 0;
+        if (std::sscanf(line.c_str() + 2, "%16llx %u %u %u %u %c", &id, &originalFirst,
+                        &originalLast, &correctedFirst, &correctedLast, &extra) != 5 ||
+            originalFirst > 0xFFFFu || originalLast > 0xFFFFu ||
+            correctedFirst > 0xFFFFu || correctedLast > 0xFFFFu) continue;
+        addDateCorrection({static_cast<u16>(originalFirst), static_cast<u16>(originalLast),
+                           static_cast<u16>(correctedFirst), static_cast<u16>(correctedLast)},
+                          static_cast<u64>(id));
+    }
+}
+
+void loadDatabase() {
+    gDatabase = {{"", ""}, std::map<u64, std::vector<DateCorrection> >(), 0};
+    std::ifstream databaseExists(kDatabase);
+    const bool hadDatabase = databaseExists.good();
+    std::ifstream legacyConfigExists(kLegacyConfig);
+    const bool hadLegacyConfig = legacyConfigExists.good();
+    std::ifstream legacyCorrectionsExists(kLegacyDateCorrections);
+    const bool hadLegacyCorrections = legacyCorrectionsExists.good();
+    std::ifstream file(kDatabase);
+    std::string line;
+    if (file && std::getline(file, line) && line == "PHALKPROFILES_DB=1") {
+        while (std::getline(file, line)) {
+            trimCR(line);
+            const size_t separator = line.find('=');
+            if (separator == std::string::npos) continue;
+            const std::string key = line.substr(0, separator);
+            const std::string value = line.substr(separator + 1);
+            if (key == "USERNAME") decodeHex(value, gDatabase.config.username);
+            else if (key == "PASSWORD") decodeHex(value, gDatabase.config.password);
+            else if (key == "LAST_ACTIVITY_LOG_UPDATE")
+                gDatabase.lastActivityLogUpdate = static_cast<uint64_t>(std::strtoull(value.c_str(), NULL, 10));
+            else if (key == "DATE_CORRECTION") {
+                unsigned long long id = 0;
+                unsigned int originalFirst = 0, originalLast = 0, correctedFirst = 0, correctedLast = 0;
+                char extra = 0;
+                if (std::sscanf(value.c_str(), "%16llx %u %u %u %u %c", &id, &originalFirst,
+                                &originalLast, &correctedFirst, &correctedLast, &extra) == 5 &&
+                    originalFirst <= 0xFFFFu && originalLast <= 0xFFFFu &&
+                    correctedFirst <= 0xFFFFu && correctedLast <= 0xFFFFu)
+                    addDateCorrection({static_cast<u16>(originalFirst), static_cast<u16>(originalLast),
+                                       static_cast<u16>(correctedFirst), static_cast<u16>(correctedLast)},
+                                      static_cast<u64>(id));
+            }
+        }
+    }
+
+    if (gDatabase.config.username.empty() && gDatabase.config.password.empty()) {
+        std::ifstream legacy(kLegacyConfig);
+        if (legacy) {
+            std::getline(legacy, gDatabase.config.username);
+            std::getline(legacy, gDatabase.config.password);
+            trimCR(gDatabase.config.username);
+            trimCR(gDatabase.config.password);
+            if (gDatabase.config.username.compare(0, 3, "\xef\xbb\xbf") == 0)
+                gDatabase.config.username.erase(0, 3);
+        }
+    }
+    loadLegacyDateCorrections();
+    if (!hadDatabase || hadLegacyConfig || hadLegacyCorrections) saveDatabase();
+}
+
+bool saveDatabase() {
     ensureDirectory();
-    std::ofstream file(kConfig, std::ios::binary | std::ios::trunc);
+    std::ofstream file(kDatabase, std::ios::binary | std::ios::trunc);
     if (!file) return false;
-    file << config.username << '\n' << config.password << '\n';
+    file << "PHALKPROFILES_DB=1\n";
+    file << "USERNAME=" << encodeHex(gDatabase.config.username) << '\n';
+    file << "PASSWORD=" << encodeHex(gDatabase.config.password) << '\n';
+    file << "LAST_ACTIVITY_LOG_UPDATE=" << gDatabase.lastActivityLogUpdate << '\n';
+    for (const auto& item : gDatabase.dateCorrections) {
+        for (const DateCorrection& correction : item.second) {
+            file << "DATE_CORRECTION=" << std::uppercase << std::hex << item.first << std::dec
+                 << ' ' << correction.originalFirst << ' ' << correction.originalLast
+                 << ' ' << correction.correctedFirst << ' ' << correction.correctedLast << '\n';
+        }
+    }
     file.flush();
-    return file.good();
+    bool okay = file.good();
+    file.close();
+    okay = okay && !file.fail();
+    if (!okay) return false;
+    std::remove(kLegacyConfig);
+    std::remove(kLegacyDateCorrections);
+    return true;
 }
 
 bool prepareExport(const std::vector<ActivityTitle>& records, unsigned int& count, std::string& error) {
@@ -489,22 +612,21 @@ bool askText(const char* hint, bool password, std::string& output) {
     return true;
 }
 
-void draw(const Config& config, const std::string& status, int selected,
-          const ActivityLogInfo& activityLogInfo) {
+void draw(const Config& config, const std::string& status, int selected) {
     consoleClear();
     std::printf("PHALK PROFILES - NINTENDO 3DS\n");
     std::printf("--------------------------------\n\n");
     std::printf("Account: %.26s\n", config.username.empty() ? "(not set)" : config.username.c_str());
     std::printf("Password: %s\n", config.password.empty() ? "(not set)" : "********");
-    const std::string lastOpened = formatActivityLogLastOpened(activityLogInfo);
-    std::printf("Activity Log last opened: %s\n", lastOpened.c_str());
-    std::printf("Open it before exporting to refresh sessions.\n\n");
+    const std::string lastUpdate = formatLastActivityLogUpdate();
+    std::printf("Last update request: %s\n", lastUpdate.c_str());
+    std::printf("Recent sessions save when Activity Log opens.\n");
+    std::printf("Open it before uploading to include them.\n\n");
 
     const std::string updateAction = std::string("Update Activity Log (Last update: ") +
-        (activityLogInfo.lastOpenedKnown ? lastOpened.substr(0, 10) : "unknown") + ")";
-    const std::string actions[] = {"Create JSON", "Create and upload", "Set username", "Set password",
-                                   updateAction, "Exit"};
-    for (int i = 0; i < 6; ++i)
+        (gDatabase.lastActivityLogUpdate != 0 ? lastUpdate.substr(0, 10) : "unknown") + ")";
+    const std::string actions[] = {updateAction, "Create and upload", "Set username", "Set password", "Exit"};
+    for (int i = 0; i < 5; ++i)
         std::printf(" %c %s\n", i == selected ? '>' : ' ', actions[i].c_str());
     std::printf("\nStatus:\n");
     for (size_t start = 0; start < status.size() && start < 175; start += 35)
@@ -521,34 +643,44 @@ int main() {
     consoleInit(GFX_TOP, NULL);
     const Result fsResult = fsInit();
     const Result romfsResult = romfsInit();
+    loadDatabase();
     Config config = loadConfig();
     std::string status = R_FAILED(fsResult) ? "File system init failed"
         : (R_SUCCEEDED(romfsResult) ? "Ready" : "Game database unavailable");
-    const ActivityLogInfo activityLogInfo = readActivityLogInfo();
     int selected = 0;
     bool dirty = true;
     bool openActivityLog = false;
+    u64 activityLogTitleId = 0;
 
     while (aptMainLoop()) {
         hidScanInput();
         u32 down = hidKeysDown();
         if (down & KEY_START) break;
-        if (down & KEY_UP) { selected = (selected + 5) % 6; dirty = true; }
-        if (down & KEY_DOWN) { selected = (selected + 1) % 6; dirty = true; }
+        if (down & KEY_UP) { selected = (selected + 4) % 5; dirty = true; }
+        if (down & KEY_DOWN) { selected = (selected + 1) % 5; dirty = true; }
 
         if (down & KEY_A) {
-            if (selected == 5) break;
-            if (selected == 4) {
-                const u64 titleId = activityLogInfo.titleId != 0
-                    ? activityLogInfo.titleId : activityLogTitleIdForSystemRegion();
-                if (titleId == 0) {
+            if (selected == 4) break;
+            if (selected == 0) {
+                activityLogTitleId = activityLogTitleIdForSystemRegion();
+                const uint64_t previousUpdate = gDatabase.lastActivityLogUpdate;
+                const std::time_t now = std::time(NULL);
+                if (activityLogTitleId == 0) {
                     status = "Could not identify the system region";
+                } else if (now == static_cast<std::time_t>(-1)) {
+                    status = "Could not read the console date and time";
                 } else {
-                    status = "Opening Activity Log...";
-                    draw(config, status, selected, activityLogInfo);
-                    presentFrame();
-                    openActivityLog = true;
-                    break;
+                    gDatabase.lastActivityLogUpdate = static_cast<uint64_t>(now);
+                    if (!saveDatabase()) {
+                        gDatabase.lastActivityLogUpdate = previousUpdate;
+                        status = "Could not save database.txt";
+                    } else {
+                        status = "Opening Activity Log...";
+                        draw(config, status, selected);
+                        presentFrame();
+                        openActivityLog = true;
+                        break;
+                    }
                 }
             } else if (selected == 2 || selected == 3) {
                 std::string value;
@@ -560,17 +692,15 @@ int main() {
             } else {
                 unsigned int count = 0;
                 status = "Reading Activity Log...";
-                draw(config, status, selected, activityLogInfo);
+                draw(config, status, selected);
                 presentFrame();
                 std::string error;
                 if (R_SUCCEEDED(fsResult) && R_SUCCEEDED(romfsResult) && prepareValidatedExport(count, error)) {
                     status = "JSON created: " + std::to_string(count) + " titles";
-                    if (selected == 1) {
-                        status = "Uploading via HTTP...";
-                        draw(config, status, selected, activityLogInfo);
-                        presentFrame();
-                        status = uploadExport(config, error) ? "Upload complete (HTTP 200)" : error;
-                    }
+                    status = "Uploading via HTTP...";
+                    draw(config, status, selected);
+                    presentFrame();
+                    status = uploadExport(config, error) ? "Upload complete (HTTP 200)" : error;
                 } else {
                     status = R_FAILED(fsResult) ? "File system init failed"
                         : (R_FAILED(romfsResult) ? "Game database unavailable" : error);
@@ -578,13 +708,11 @@ int main() {
             }
             dirty = true;
         }
-        if (dirty) { draw(config, status, selected, activityLogInfo); dirty = false; }
+        if (dirty) { draw(config, status, selected); dirty = false; }
         presentFrame();
     }
     if (openActivityLog)
-        aptSetChainloader(activityLogInfo.titleId != 0
-                              ? activityLogInfo.titleId : activityLogTitleIdForSystemRegion(),
-                          MEDIATYPE_NAND);
+        aptSetChainloader(activityLogTitleId, MEDIATYPE_NAND);
     if (R_SUCCEEDED(romfsResult)) romfsExit();
     if (R_SUCCEEDED(fsResult)) fsExit();
     gfxExit();
