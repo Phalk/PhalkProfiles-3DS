@@ -1,16 +1,16 @@
-# Como usar o Phalk Profiles no 3DS
+# Using Phalk Profiles on Nintendo 3DS
 
-1. Copie `PhalkProfiles-3DS.3dsx` para a pasta `/3ds/PhalkProfiles/` do cartão SD.
-2. Abra o app pelo Homebrew Launcher.
-3. Escolha **Set username** e **Set password** para informar sua conta do Phalk Profiles.
-4. Escolha **Create JSON** para salvar seu histórico no cartão SD ou **Create and upload** para salvar e enviar ao site. Para enviar, conecte o 3DS ao Wi-Fi.
+1. Copy `PhalkProfiles-3DS.3dsx` to the `/3ds/PhalkProfiles/` folder on your SD card.
+2. Launch the app from the Homebrew Launcher.
+3. Select **Set username** and **Set password** to enter your Phalk Profiles account credentials.
+4. Select **Create JSON** to save your activity history to the SD card, or **Create and upload** to save it and upload it to the website. Connect your 3DS to Wi-Fi to upload.
 
-O arquivo gerado fica em `/3ds/PhalkProfiles/export.json`. O app lê o Registro de Atividades do próprio 3DS; você não precisa do Activity Log++.
+The generated file is saved to `/3ds/PhalkProfiles/export.json`. The app reads the Activity Log directly from the 3DS; Activity Log++ is not required.
 
-Os nomes dos jogos são consultados localmente pelo TitleID no banco `romfs:/3ds_db.json`, incluído no aplicativo. O nome encontrado também é gravado no campo `name` do `export.json`.
+Game names are looked up locally by Title ID in the database bundled at `romfs:/3ds_db.json`. The matched name is also written to the `name` field in `export.json`.
 
-Se encontrar datas futuras, o app mostra o nome do jogo e as datas de início e fim. Use **esquerda/direita** para escolher ano, mês ou dia de cada data; use **cima/baixo** para alterar o valor. Pressione **A** para salvar ou **B** para cancelar. O JSON só é criado depois que todas as datas futuras forem corrigidas. As correções ficam em `/3ds/PhalkProfiles/date_corrections.txt`; o registro da NAND não é alterado. Correções feitas na tela antiga precisam ser salvas de novo.
+If future dates are found, the app displays the game name and its first- and last-played dates. Use **left/right** to select the year, month, or day for each date, and **up/down** to change the selected value. Press **A** to save or **B** to cancel. The JSON file is created only after all future dates have been corrected. Corrections are saved to `/3ds/PhalkProfiles/date_corrections.txt`; the NAND Activity Log is not modified. Corrections made in the previous screen must be saved again.
 
-Use cima/baixo para navegar, **A** para selecionar e **START** para sair.
+Use **up/down** to navigate, **A** to select, and **START** to exit.
 
-**Atenção:** o envio usa HTTP sem criptografia. Sua senha e seu histórico trafegam pela rede sem proteção.
+**Warning:** uploads use unencrypted HTTP. Your password and activity history are transmitted over the network without protection.
