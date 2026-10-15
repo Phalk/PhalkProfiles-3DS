@@ -1,6 +1,7 @@
 #include "activity_log.hpp"
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -10,9 +11,19 @@ namespace {
 
 // Activity Log system save IDs in USA, EUR, JPN and KOR respectively.
 const u32 kSaveIds[] = {0x00020212, 0x00020222, 0x00020202, 0x00020272};
+const u32 kSessionOffset = 0x10;
+const size_t kSessionCount = 50000;
 const u32 kSummaryOffset = 0xC3510;
 const size_t kSummaryCount = 256;
+const size_t kSessionChunkCount = 256;
 const char* const kTitleDatabasePath = "romfs:/3ds_db.json";
+
+struct PldSession {
+    u64 id;
+    u32 timestamp;
+    u32 playSeconds;
+};
+static_assert(sizeof(PldSession) == 16, "Unexpected pld.dat session layout");
 
 struct PldSummary {
     u64 id;
@@ -60,7 +71,8 @@ std::string hexCode(Result code) {
 }
 
 // A successful archive open alone does not guarantee the save contains pld.dat.
-bool readSummaries(PldSummary* summaries, Result& lastError) {
+bool readSummaries(PldSummary* summaries, u16* latestSessionDays,
+                   u16* latestFutureSessionDays, u32 todayDays, Result& lastError) {
     for (size_t i = 0; i < sizeof(kSaveIds) / sizeof(kSaveIds[0]); ++i) {
         const u32 pathData[2] = {MEDIATYPE_NAND, kSaveIds[i]};
         const FS_Path archivePath = {PATH_BINARY, sizeof(pathData), pathData};
@@ -82,6 +94,42 @@ bool readSummaries(PldSummary* summaries, Result& lastError) {
                 if (R_SUCCEEDED(rc) && bytesRead != sizeof(PldSummary) * kSummaryCount)
                     rc = static_cast<Result>(-1);
             }
+            if (R_SUCCEEDED(rc)) {
+                std::map<u64, size_t> summaryById;
+                for (size_t j = 0; j < kSummaryCount; ++j) {
+                    latestSessionDays[j] = 0;
+                    latestFutureSessionDays[j] = 0;
+                    if (summaries[j].id != 0 && summaries[j].id != ~u64(0))
+                        summaryById[summaries[j].id] = j;
+                }
+
+                PldSession chunk[kSessionChunkCount];
+                for (size_t start = 0; start < kSessionCount && R_SUCCEEDED(rc);
+                     start += kSessionChunkCount) {
+                    const size_t count = std::min(kSessionChunkCount, kSessionCount - start);
+                    const u32 offset = kSessionOffset + static_cast<u32>(start * sizeof(PldSession));
+                    const u32 bytes = static_cast<u32>(count * sizeof(PldSession));
+                    u32 bytesRead = 0;
+                    rc = FSFILE_Read(file, &bytesRead, offset, chunk, bytes);
+                    if (R_SUCCEEDED(rc) && bytesRead != bytes) rc = static_cast<Result>(-1);
+                    if (R_FAILED(rc)) break;
+
+                    for (size_t j = 0; j < count; ++j) {
+                        const PldSession& session = chunk[j];
+                        if (session.id == 0 || session.id == ~u64(0) ||
+                            session.timestamp == 0 || session.timestamp % 3600 != 0 ||
+                            session.playSeconds > 3600) continue;
+                        const std::map<u64, size_t>::const_iterator found = summaryById.find(session.id);
+                        if (found == summaryById.end()) continue;
+                        const u32 days = session.timestamp / 86400;
+                        if (days == 0 || days >= 0xFFFFu) continue;
+                        u16* latest = days <= todayDays + 1
+                            ? &latestSessionDays[found->second]
+                            : &latestFutureSessionDays[found->second];
+                        if (days > *latest) *latest = static_cast<u16>(days);
+                    }
+                }
+            }
             FSFILE_Close(file);
         }
         FSUSER_CloseArchive(archive);
@@ -93,11 +141,13 @@ bool readSummaries(PldSummary* summaries, Result& lastError) {
 
 } // namespace
 
-bool readActivityLog(std::vector<ActivityTitle>& titles, std::string& error) {
+bool readActivityLog(std::vector<ActivityTitle>& titles, u32 todayDays, std::string& error) {
     titles.clear();
     PldSummary records[kSummaryCount];
+    u16 latestSessionDays[kSummaryCount] = {};
+    u16 latestFutureSessionDays[kSummaryCount] = {};
     Result rc = static_cast<Result>(-1);
-    if (!readSummaries(records, rc)) {
+    if (!readSummaries(records, latestSessionDays, latestFutureSessionDays, todayDays, rc)) {
         error = "Could not read pld.dat (" + hexCode(rc) + "). Check CFW/Activity Log";
         return false;
     }
@@ -107,7 +157,8 @@ bool readActivityLog(std::vector<ActivityTitle>& titles, std::string& error) {
         if (s.id == 0 || s.id == ~u64(0)) continue;
         if (s.totalSeconds == 0xFFFFFFFFu || (s.totalSeconds == 0 && s.launchCount == 0))
             continue;
-        ActivityTitle entry = {s.id, s.totalSeconds, s.launchCount, s.firstDays, s.lastDays};
+        ActivityTitle entry = {s.id, s.totalSeconds, s.launchCount, s.firstDays, s.lastDays,
+                               latestSessionDays[i], latestFutureSessionDays[i]};
         titles.push_back(entry);
     }
     if (titles.empty()) {

@@ -7,6 +7,8 @@
 
 The generated file is saved to `/3ds/PhalkProfiles/export.json`.
 
+For the latest play sessions, open the built-in Activity Log once before launching this app. The 3DS may keep recent sessions out of its saved `pld.dat` until Activity Log is opened.
+
 Game names are looked up locally by Title ID in the database bundled at `romfs:/3ds_db.json`. The matched name is also written to the `name` field in `export.json`.
 
 If future dates are found, the app displays the game name and its first- and last-played dates. Use **left/right** to select the year, month, or day for each date, and **up/down** to change the selected value. Press **A** to save or **B** to cancel. The JSON file is created only after all future dates have been corrected. Corrections are saved to `/3ds/PhalkProfiles/date_corrections.txt`; the NAND Activity Log is not modified. Corrections made in the previous screen must be saved again.

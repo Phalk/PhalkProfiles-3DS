@@ -11,10 +11,12 @@ struct ActivityTitle {
     u16 launches;
     u16 firstPlayedDays;
     u16 lastPlayedDays;
+    u16 latestSessionDays;        // Latest session on or near the console's current date.
+    u16 latestFutureSessionDays;  // Kept separate so stale future sessions do not mask newer play.
 };
 
 // Reads the console's own Activity Log summary from NAND without modifying it.
-bool readActivityLog(std::vector<ActivityTitle>& titles, std::string& error);
+bool readActivityLog(std::vector<ActivityTitle>& titles, u32 todayDays, std::string& error);
 
 // Looks up a title name in the bundled RomFS database by its 3DS TitleID.
 // Returns an empty string when the TitleID is not in the database.

@@ -126,7 +126,7 @@ void printEditableDate(const char* label, const EditableDate& date, int firstFie
                 activityDayNumber(date.year, date.month, date.day) > today ? "  FUTURE" : "");
 }
 
-void applyDateCorrections(std::vector<ActivityTitle>& records) {
+void applyDateCorrections(std::vector<ActivityTitle>& records, u32 today) {
     std::map<u64, std::vector<DateCorrection> > saved;
     std::ifstream file(kDateCorrections);
     std::string line;
@@ -147,16 +147,28 @@ void applyDateCorrections(std::vector<ActivityTitle>& records) {
     }
     for (ActivityTitle& entry : records) {
         const std::map<u64, std::vector<DateCorrection> >::const_iterator found = saved.find(entry.id);
-        if (found == saved.end()) continue;
         const u16 originalFirst = entry.firstPlayedDays;
         const u16 originalLast = entry.lastPlayedDays;
-        for (const DateCorrection& correction : found->second) {
-            if (originalFirst == correction.originalFirst &&
-                originalLast == correction.originalLast) {
-                entry.firstPlayedDays = correction.correctedFirst;
-                entry.lastPlayedDays = correction.correctedLast;
+        bool lastCorrectionApplied = false;
+        if (found != saved.end()) {
+            for (const DateCorrection& correction : found->second) {
+                if (originalFirst == correction.originalFirst)
+                    entry.firstPlayedDays = correction.correctedFirst;
+                if (originalLast == correction.originalLast) {
+                    entry.lastPlayedDays = correction.correctedLast;
+                    lastCorrectionApplied = true;
+                }
             }
         }
+
+        if (entry.latestSessionDays != 0 &&
+            ((!lastCorrectionApplied && futureDate(originalLast, today)) ||
+             entry.latestSessionDays > entry.lastPlayedDays))
+            entry.lastPlayedDays = entry.latestSessionDays;
+        else if (entry.latestSessionDays == 0 && entry.latestFutureSessionDays != 0 &&
+                 !futureDate(originalLast, today) &&
+                 entry.latestFutureSessionDays > entry.lastPlayedDays)
+            entry.lastPlayedDays = entry.latestFutureSessionDays;
     }
 }
 
@@ -353,17 +365,16 @@ bool prepareExport(const std::vector<ActivityTitle>& records, unsigned int& coun
 
 bool prepareValidatedExport(unsigned int& count, std::string& error) {
     std::vector<ActivityTitle> original;
-    if (!readActivityLog(original, error)) return false;
-
     u32 today = 0;
     std::string todayText;
     if (!currentActivityDay(today, todayText)) {
         error = "Check the 3DS date and time";
         return false;
     }
+    if (!readActivityLog(original, today, error)) return false;
 
     std::vector<ActivityTitle> records = original;
-    applyDateCorrections(records);
+    applyDateCorrections(records, today);
     if (!reviewFutureDates(records, original, today, todayText, error)) return false;
     return prepareExport(records, count, error);
 }
