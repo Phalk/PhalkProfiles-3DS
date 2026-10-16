@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstring>
 #include <ctime>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -20,14 +21,15 @@ using nlohmann::json;
 namespace {
 
 const char* const kDirectory = "sdmc:/3ds/PhalkProfiles";
-const char* const kDatabase = "sdmc:/3ds/PhalkProfiles/database.txt";
-const char* const kLegacyConfig = "sdmc:/3ds/PhalkProfiles/config.txt";
+const char* const kConfig = "sdmc:/3ds/PhalkProfiles/config.txt";
+const char* const kPreviousConfig = "sdmc:/3ds/PhalkProfiles/database.txt";
 const char* const kExport = "sdmc:/3ds/PhalkProfiles/export.json";
 const char* const kLegacyDateCorrections = "sdmc:/3ds/PhalkProfiles/date_corrections.txt";
 const char* const kEndpoint = "http://www.phalk.net/profiles/json_curl.php";
 
 void ensureDirectory();
 bool saveDatabase();
+bool gMigratePreviousConfig = false;
 
 PlayDataDatabase gPlayDataDatabase;
 
@@ -40,6 +42,8 @@ void presentFrame() {
 struct Config {
     std::string username;
     std::string password;
+    int timezoneOffsetMinutes;
+    bool timezoneConfigured;
 };
 
 struct DateCorrection {
@@ -55,7 +59,25 @@ struct AppDatabase {
     uint64_t lastActivityLogUpdate;
 };
 
-AppDatabase gDatabase = {{"", ""}, std::map<u64, std::vector<DateCorrection> >(), 0};
+AppDatabase gDatabase = {{"", "", 0, false}, std::map<u64, std::vector<DateCorrection> >(), 0};
+
+const int kMinimumTimezoneOffsetMinutes = -12 * 60;
+const int kMaximumTimezoneOffsetMinutes = 14 * 60;
+
+u64 exportUnixTime(u64 localTimestamp, const Config& config) {
+    const s64 utcTimestamp = static_cast<s64>(localTimestamp) -
+                             static_cast<s64>(config.timezoneOffsetMinutes) * 60;
+    return utcTimestamp < 0 ? 0 : static_cast<u64>(utcTimestamp);
+}
+
+std::string timezoneLabel(int offsetMinutes) {
+    const char sign = offsetMinutes < 0 ? '-' : '+';
+    const int absoluteMinutes = offsetMinutes < 0 ? -offsetMinutes : offsetMinutes;
+    char text[24];
+    std::snprintf(text, sizeof(text), "UTC%c%02d:%02d", sign,
+                  absoluteMinutes / 60, absoluteMinutes % 60);
+    return text;
+}
 
 struct EditableDate {
     int year;
@@ -302,6 +324,58 @@ bool saveConfig(const Config& config) {
     return false;
 }
 
+bool configureTimezone(Config& config, std::string& status) {
+    int offset = config.timezoneConfigured ? config.timezoneOffsetMinutes : 0;
+    bool dirty = true;
+    while (aptMainLoop()) {
+        if (dirty) {
+            consoleClear();
+            std::printf("SETUP 3DS TIMEZONE\n");
+            std::printf("--------------------------------\n\n");
+            std::printf("Set the same timezone/UTC offset\n");
+            std::printf("that is configured on your 3DS.\n\n");
+            std::printf("This lets Phalk Profiles send dates\n");
+            std::printf("and times coherently to the website.\n\n");
+            std::printf("3DS offset: %s\n\n", timezoneLabel(offset).c_str());
+            std::printf("Left/Right: change by 15 minutes\n");
+            std::printf("Up/Down: change by 1 hour\n");
+            std::printf("A: save   B: cancel\n");
+            dirty = false;
+        }
+        presentFrame();
+        hidScanInput();
+        const u32 down = hidKeysDown();
+        const u32 repeat = hidKeysDownRepeat();
+        if (down & (KEY_B | KEY_START)) {
+            status = "Timezone setup cancelled";
+            return false;
+        }
+        int step = 0;
+        if (repeat & KEY_LEFT) step = -15;
+        else if (repeat & KEY_RIGHT) step = 15;
+        else if (repeat & KEY_DOWN) step = -60;
+        else if (repeat & KEY_UP) step = 60;
+        if (step != 0) {
+            offset = std::max(kMinimumTimezoneOffsetMinutes,
+                              std::min(kMaximumTimezoneOffsetMinutes, offset + step));
+            dirty = true;
+        }
+        if (down & KEY_A) {
+            Config updated = config;
+            updated.timezoneOffsetMinutes = offset;
+            updated.timezoneConfigured = true;
+            if (!saveConfig(updated)) {
+                status = "Could not save timezone setting";
+                return false;
+            }
+            config = updated;
+            status = "3DS timezone saved";
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string encodeHex(const std::string& value) {
     static const char digits[] = "0123456789ABCDEF";
     std::string encoded;
@@ -358,17 +432,26 @@ void loadLegacyDateCorrections() {
     }
 }
 
+bool hasConfigHeader(const char* path) {
+    std::ifstream file(path, std::ios::binary);
+    std::string header;
+    return file && std::getline(file, header) && header == "PHALKPROFILES_DB=1";
+}
+
 void loadDatabase() {
-    gDatabase = {{"", ""}, std::map<u64, std::vector<DateCorrection> >(), 0};
-    std::ifstream databaseExists(kDatabase);
-    const bool hadDatabase = databaseExists.good();
-    std::ifstream legacyConfigExists(kLegacyConfig);
-    const bool hadLegacyConfig = legacyConfigExists.good();
+    gDatabase = {{"", "", 0, false}, std::map<u64, std::vector<DateCorrection> >(), 0};
+    gMigratePreviousConfig = false;
+    const bool hadConfigFile = hasConfigHeader(kConfig);
+    const bool hadPreviousConfig = hasConfigHeader(kPreviousConfig);
+    const char* sourcePath = hadConfigFile ? kConfig : (hadPreviousConfig ? kPreviousConfig : NULL);
+    gMigratePreviousConfig = !hadConfigFile && hadPreviousConfig;
     std::ifstream legacyCorrectionsExists(kLegacyDateCorrections);
     const bool hadLegacyCorrections = legacyCorrectionsExists.good();
-    std::ifstream file(kDatabase);
+    std::ifstream file;
+    if (sourcePath) file.open(sourcePath, std::ios::binary);
     std::string line;
     if (file && std::getline(file, line) && line == "PHALKPROFILES_DB=1") {
+        bool timezoneOffsetLoaded = false;
         while (std::getline(file, line)) {
             trimCR(line);
             const size_t separator = line.find('=');
@@ -377,6 +460,16 @@ void loadDatabase() {
             const std::string value = line.substr(separator + 1);
             if (key == "USERNAME") decodeHex(value, gDatabase.config.username);
             else if (key == "PASSWORD") decodeHex(value, gDatabase.config.password);
+            else if (key == "TIMEZONE_OFFSET_MINUTES") {
+                const int offset = std::atoi(value.c_str());
+                if (offset >= kMinimumTimezoneOffsetMinutes &&
+                    offset <= kMaximumTimezoneOffsetMinutes && offset % 15 == 0) {
+                    gDatabase.config.timezoneOffsetMinutes = offset;
+                    timezoneOffsetLoaded = true;
+                }
+            }
+            else if (key == "TIMEZONE_CONFIGURED")
+                gDatabase.config.timezoneConfigured = value == "1";
             else if (key == "LAST_ACTIVITY_LOG_UPDATE")
                 gDatabase.lastActivityLogUpdate = static_cast<uint64_t>(std::strtoull(value.c_str(), NULL, 10));
             else if (key == "DATE_CORRECTION") {
@@ -392,12 +485,14 @@ void loadDatabase() {
                                       static_cast<u64>(id));
             }
         }
+        if (!timezoneOffsetLoaded) gDatabase.config.timezoneConfigured = false;
     }
 
-    if (gDatabase.config.username.empty() && gDatabase.config.password.empty()) {
-        std::ifstream legacy(kLegacyConfig);
-        if (legacy) {
-            std::getline(legacy, gDatabase.config.username);
+    if (!hadConfigFile) {
+        std::ifstream legacy(kConfig);
+        std::string legacyHeader;
+        if (legacy && std::getline(legacy, legacyHeader) && legacyHeader != "PHALKPROFILES_DB=1") {
+            gDatabase.config.username = legacyHeader;
             std::getline(legacy, gDatabase.config.password);
             trimCR(gDatabase.config.username);
             trimCR(gDatabase.config.password);
@@ -406,16 +501,18 @@ void loadDatabase() {
         }
     }
     loadLegacyDateCorrections();
-    if (!hadDatabase || hadLegacyConfig || hadLegacyCorrections) saveDatabase();
+    if (!hadConfigFile || hadLegacyCorrections) saveDatabase();
 }
 
 bool saveDatabase() {
     ensureDirectory();
-    std::ofstream file(kDatabase, std::ios::binary | std::ios::trunc);
+    std::ofstream file(kConfig, std::ios::binary | std::ios::trunc);
     if (!file) return false;
     file << "PHALKPROFILES_DB=1\n";
     file << "USERNAME=" << encodeHex(gDatabase.config.username) << '\n';
     file << "PASSWORD=" << encodeHex(gDatabase.config.password) << '\n';
+    file << "TIMEZONE_OFFSET_MINUTES=" << gDatabase.config.timezoneOffsetMinutes << '\n';
+    file << "TIMEZONE_CONFIGURED=" << (gDatabase.config.timezoneConfigured ? 1 : 0) << '\n';
     file << "LAST_ACTIVITY_LOG_UPDATE=" << gDatabase.lastActivityLogUpdate << '\n';
     for (const auto& item : gDatabase.dateCorrections) {
         for (const DateCorrection& correction : item.second) {
@@ -429,13 +526,17 @@ bool saveDatabase() {
     file.close();
     okay = okay && !file.fail();
     if (!okay) return false;
-    std::remove(kLegacyConfig);
+    if (gMigratePreviousConfig) {
+        std::remove(kPreviousConfig);
+        gMigratePreviousConfig = false;
+    }
     std::remove(kLegacyDateCorrections);
     return true;
 }
 
 bool prepareExport(const std::vector<ActivityTitle>& records, unsigned int& count,
-                   std::string& error, const char* outputPath) {
+                   std::string& error, const char* outputPath, bool includeSessionTime,
+                   const Config& config) {
     count = 0;
     json titles = json::array();
     for (const ActivityTitle& entry : records) {
@@ -443,14 +544,22 @@ bool prepareExport(const std::vector<ActivityTitle>& records, unsigned int& coun
         std::snprintf(id, sizeof(id), "%016llX", static_cast<unsigned long long>(entry.id));
         std::string name = activityTitleName(entry.id);
         if (name.empty()) name = std::string("Unknown Game (") + id + ")";
+        const u64 localLastPlayed = activityUnixTime(entry.lastPlayedDays);
+        u64 lastPlayed = localLastPlayed;
+        if (includeSessionTime && entry.latestSessionSeconds != 0 &&
+            entry.lastPlayedDays != 0xFFFFu &&
+            entry.latestSessionSeconds / 86400u == entry.lastPlayedDays) {
+            lastPlayed += entry.latestSessionSeconds % 86400u;
+        }
+        lastPlayed = exportUnixTime(lastPlayed, config);
 
         titles.push_back({
             {"id", id},
             {"name", name},
             {"platform", "Nintendo 3DS"},
             {"summary", {
-                {"firstPlayed", activityUnixTime(entry.firstPlayedDays)},
-                {"lastPlayed", activityUnixTime(entry.lastPlayedDays)},
+                {"firstPlayed", exportUnixTime(activityUnixTime(entry.firstPlayedDays), config)},
+                {"lastPlayed", lastPlayed},
                 {"playtime", entry.playtimeSeconds},
                 {"launches", entry.launches}
             }}
@@ -466,7 +575,7 @@ bool prepareExport(const std::vector<ActivityTitle>& records, unsigned int& coun
         {"exportString", "Exported using PhalkProfiles 3DS"},
         {"platform", "Nintendo 3DS"},
         {"source", "PhalkProfiles-3DS"},
-        {"exportTimestamp", static_cast<uint64_t>(std::time(NULL))},
+        {"exportTimestamp", exportUnixTime(static_cast<uint64_t>(std::time(NULL)), config)},
         {"users", json::array({user})}
     };
 
@@ -480,7 +589,11 @@ bool prepareExport(const std::vector<ActivityTitle>& records, unsigned int& coun
     return true;
 }
 
-bool prepareValidatedExport(unsigned int& count, std::string& error) {
+bool prepareValidatedExport(unsigned int& count, std::string& error, const Config& config) {
+    if (!config.timezoneConfigured) {
+        error = "Set up the 3DS timezone before exporting";
+        return false;
+    }
     std::vector<ActivityTitle> original;
     u32 today = 0;
     std::string todayText;
@@ -493,10 +606,14 @@ bool prepareValidatedExport(unsigned int& count, std::string& error) {
     std::vector<ActivityTitle> records = original;
     applyDateCorrections(records, today);
     if (!reviewFutureDates(records, original, today, todayText, error)) return false;
-    return prepareExport(records, count, error, kExport);
+    return prepareExport(records, count, error, kExport, false, config);
 }
 
-bool prepareDatabaseExport(unsigned int& count, std::string& error) {
+bool prepareDatabaseExport(unsigned int& count, std::string& error, const Config& config) {
+    if (!config.timezoneConfigured) {
+        error = "Set up the 3DS timezone before exporting";
+        return false;
+    }
     if (!gPlayDataDatabase.initialized) {
         error = "The local play data database is not initialized";
         return false;
@@ -519,7 +636,7 @@ bool prepareDatabaseExport(unsigned int& count, std::string& error) {
     applyDateCorrections(records, today);
     if (!reviewFutureDates(records, original, today, todayText, error)) return false;
     ensureDirectory();
-    return prepareExport(records, count, error, kExport);
+    return prepareExport(records, count, error, kExport, true, config);
 }
 
 bool uploadExport(const Config& config, std::string& error) {
@@ -638,24 +755,23 @@ void draw(const Config& config, const std::string& status, int selected) {
     std::printf("--------------------------------\n\n");
     std::printf("Account: %.26s\n", config.username.empty() ? "(not set)" : config.username.c_str());
     std::printf("Password: %s\n", config.password.empty() ? "(not set)" : "********");
+    std::printf("3DS timezone: %s\n", config.timezoneConfigured
+        ? timezoneLabel(config.timezoneOffsetMinutes).c_str() : "not set");
     std::printf("Local play data: %s\n\n",
         gPlayDataDatabase.initialized ? "initialized" : "will initialize from PLD");
 
     const std::string actions[] = {
         "Upload play data",
-        "Upload play data using Activity Log (PLD)",
+        "Upload using Activity Log Save (PLD)",
+        "Setup 3DS timezone",
         "Set username",
         "Set password",
         "Reset local play data database",
         "Exit"
     };
-    for (int i = 0; i < 6; ++i)
+    for (int i = 0; i < 7; ++i)
         std::printf(" %c %s\n", i == selected ? '>' : ' ', actions[i].c_str());
-    std::printf("\nStatus:\n");
-    for (size_t start = 0; start < status.size() && start < 175; start += 35)
-        std::printf("%.*s\n", 35, status.c_str() + start);
-    std::printf("\nPLD upload: open Activity Log first so it\n");
-    std::printf("can write recent play sessions to pld.dat.\n");
+    std::printf("\nStatus: %.42s\n\n", status.c_str());
     std::printf("A: select  START: exit\n");
 }
 
@@ -710,13 +826,15 @@ int main() {
         hidScanInput();
         u32 down = hidKeysDown();
         if (down & KEY_START) break;
-        if (down & KEY_UP) { selected = (selected + 5) % 6; dirty = true; }
-        if (down & KEY_DOWN) { selected = (selected + 1) % 6; dirty = true; }
+        if (down & KEY_UP) { selected = (selected + 6) % 7; dirty = true; }
+        if (down & KEY_DOWN) { selected = (selected + 1) % 7; dirty = true; }
 
         if (down & KEY_A) {
-            if (selected == 5) break;
+            if (selected == 6) break;
             if (selected == 0) {
-                if (!playDataDatabaseLoaded) {
+                if (!config.timezoneConfigured) {
+                    status = "Set up the 3DS timezone before exporting";
+                } else if (!playDataDatabaseLoaded) {
                     status = playDataDatabaseError;
                 } else if (R_FAILED(fsResult) || R_FAILED(romfsResult)) {
                     status = R_FAILED(fsResult) ? "File system init failed" : "Game database unavailable";
@@ -745,7 +863,7 @@ int main() {
                         status += "; preparing JSON";
                         draw(config, status, selected);
                         presentFrame();
-                        if (!prepareDatabaseExport(count, error)) {
+                        if (!prepareDatabaseExport(count, error, config)) {
                             status = error;
                         } else {
                             status = "Uploading play data...";
@@ -765,7 +883,7 @@ int main() {
                     status = "Reading Activity Log (PLD)...";
                     draw(config, status, selected);
                     presentFrame();
-                    if (!prepareValidatedExport(count, error)) {
+                    if (!prepareValidatedExport(count, error, config)) {
                         status = error;
                     } else {
                         status = "Uploading PLD data...";
@@ -775,14 +893,16 @@ int main() {
                             ? "PLD play data uploaded successfully" : error;
                     }
                 }
-            } else if (selected == 2 || selected == 3) {
+            } else if (selected == 2) {
+                configureTimezone(config, status);
+            } else if (selected == 3 || selected == 4) {
                 std::string value;
-                if (askText(selected == 2 ? "Phalk username" : "Phalk password", selected == 3, value)) {
-                    if (selected == 2) config.username = value;
+                if (askText(selected == 3 ? "Phalk username" : "Phalk password", selected == 4, value)) {
+                    if (selected == 3) config.username = value;
                     else config.password = value;
                     status = saveConfig(config) ? "Settings saved" : "Could not save settings";
                 }
-            } else if (selected == 4) {
+            } else if (selected == 5) {
                 std::string error;
                 if (confirmDatabaseReset() && resetPlayDataDatabase(error)) {
                     initializePlayDataDatabase(gPlayDataDatabase);

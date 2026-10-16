@@ -2,8 +2,11 @@
 
 1. Copy `PhalkProfiles-3DS.3dsx` to `/3ds/PhalkProfiles/` on your SD card.
 2. Launch it from the Homebrew Launcher.
-3. Choose **Set username** and **Set password** for your Phalk Profiles account.
-4. Connect to Wi-Fi and choose **Upload play data**.
+3. Choose **Setup 3DS timezone** and set the same UTC offset as the 3DS system clock.
+4. Choose **Set username** and **Set password** for your Phalk Profiles account.
+5. Connect to Wi-Fi and choose **Upload play data**.
+
+The timezone setup is required before either upload option can export data. It is saved in `/3ds/PhalkProfiles/config.txt` and applied to exported Unix timestamps so the website receives the intended date and time.
 
 ## Upload play data
 
@@ -11,11 +14,13 @@ On the first upload, the app creates `/3ds/PhalkProfiles/play_data_db.json` by c
 
 On later uploads, the app adds new sessions from PTM to the local database, creates `export.json`, and uploads it. You do not need to open the Activity Log before each upload. If the saved PTM history cursor has expired because its event buffer wrapped, open Activity Log and reset the local database so the next upload can initialize it again from PLD.
 
+After the initial PLD copy, Phalk Profiles can send the latest session time from PTM without reopening Activity Log for every upload. The Activity Log keeps the play record; Phalk Profiles gets that timestamp to the website, converted to UTC using the configured 3DS offset. 😎 (PTM timestamps have minute precision.)
+
 The app can migrate an existing prototype database at `/3ds/PhalkProfiles/ptm_test_db.json` to the new local database path. It keeps the old file as a backup.
 
-## Upload play data using Activity Log (PLD)
+## Upload using Activity Log Save (PLD)
 
-This option uses the previous PLD-based export flow and does not update the local PTM database. Open the Activity Log manually first, let it load, then return to Phalk Profiles and choose **Upload play data using Activity Log (PLD)**. The 3DS writes recent sessions to `pld.dat` when Activity Log opens.
+This option uses the previous PLD-based export flow and does not update the local PTM database. Open the Activity Log manually first, let it load, then return to Phalk Profiles and choose **Upload using Activity Log Save (PLD)**. The 3DS writes recent sessions to `pld.dat` when Activity Log opens.
 
 ## Other details
 
@@ -23,7 +28,7 @@ Game names are looked up locally by Title ID using `romfs:/3ds_db.json`. Unknown
 
 If future dates are found, the app displays the title and its first- and last-played dates. Use **left/right** to choose the year, month, or day, and **up/down** to change the selected value. Press **A** to save or **B** to cancel. Upload proceeds only after all future dates are corrected.
 
-Credentials and date corrections are stored in `/3ds/PhalkProfiles/database.txt`. The generated upload file is `/3ds/PhalkProfiles/export.json`. **Reset local play data database** removes the PTM database; the next default upload seeds a new one from the current PLD. Open Activity Log before resetting if you want that initial copy to include recent sessions.
+Credentials, timezone offset, and date corrections are stored in `/3ds/PhalkProfiles/config.txt`. Existing settings in the former `database.txt` file are migrated automatically. The generated upload file is `/3ds/PhalkProfiles/export.json`. **Reset local play data database** removes the PTM database; the next default upload seeds a new one from the current PLD. Open Activity Log before resetting if you want that initial copy to include recent sessions.
 
 Use **up/down** to navigate, **A** to select, and **START** to exit.
 
@@ -42,7 +47,7 @@ PTM changes are saved to the local database before JSON generation and upload. I
 
 Initialization reads PLD before it snapshots PTM. A session recorded in PTM between those two reads falls before the saved checkpoint and may not yet be included in PLD. Avoid launching or switching titles during first-time initialization; this small timing window is a known limitation of the current ordering.
 
-The upload JSON keeps the existing service schema: top-level export metadata and `users`, then each user's `titles`. Each title exports its hexadecimal `id`, display `name`, `platform`, and `summary` containing Unix timestamps for `firstPlayed` and `lastPlayed`, `playtime` in seconds, and `launches`. The database-only `latestSessionSeconds` and PTM cursor are not sent.
+The upload JSON keeps the existing service schema: top-level export metadata and `users`, then each user's `titles`. Each title exports its hexadecimal `id`, display `name`, `platform`, and `summary` containing Unix timestamps for `firstPlayed` and `lastPlayed`, `playtime` in seconds, and `launches`. The user must configure the 3DS UTC offset before exporting. The app interprets Activity Log and PTM date/time values as the 3DS's configured local time and subtracts the saved offset to produce UTC timestamps; this also applies to `exportTimestamp`. In the default database flow, `lastPlayed` includes the stored session time when its day matches the exported last-played day; otherwise it falls back to midnight on that date. PTM timestamps have minute precision, so their seconds are `00`. The legacy PLD export continues to use date-only `lastPlayed`. The PTM cursor is not sent.
 
 ### PTM event processing
 
@@ -60,9 +65,9 @@ The loader accepts format 1 and format 2 databases and can migrate the older pro
 
 ### PLD path and code map
 
-The separate **Upload play data using Activity Log (PLD)** action reads and exports PLD directly. It retains the older flow, including PLD-derived recent-session date handling, and does not initialize or update the PTM database. `source/activity_log.cpp` reads the system save read-only; the app does not write to `pld.dat` or launch Activity Log.
+The separate **Upload using Activity Log Save (PLD)** action reads and exports PLD directly. It retains the older flow, including PLD-derived recent-session date handling, and exports `lastPlayed` at date-only precision. It does not initialize or update the PTM database. `source/activity_log.cpp` reads the system save read-only; the app does not write to `pld.dat` or launch Activity Log.
 
-- `source/main.cpp`: menu, orchestration, date-correction UI, JSON schema, and upload.
+- `source/main.cpp`: menu, orchestration, date-correction and timezone setup screens, JSON timestamp conversion/schema, and upload.
 - `source/play_data.cpp` / `include/play_data.hpp`: PTM snapshot, session reconstruction, local database, migration, and cursor validation.
 - `source/activity_log.cpp` / `include/activity_log.hpp`: read-only PLD parser and local Title ID-to-name lookup.
-- `database.txt`: credentials and persisted date corrections; independent of the play-data database.
+- `config.txt`: credentials, timezone setting, and persisted date corrections; independent of the play-data database.
