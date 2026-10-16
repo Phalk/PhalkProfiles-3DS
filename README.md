@@ -26,3 +26,43 @@ If future dates are found, the app displays the title and its first- and last-pl
 Credentials and date corrections are stored in `/3ds/PhalkProfiles/database.txt`. The generated upload file is `/3ds/PhalkProfiles/export.json`. **Reset local play data database** removes the PTM database; the next default upload seeds a new one from the current PLD. Open Activity Log before resetting if you want that initial copy to include recent sessions.
 
 Use **up/down** to navigate, **A** to select, and **START** to exit.
+
+## Technical notes for developers
+
+### Data flow
+
+The default **Upload play data** action uses a local database as the source for every export:
+
+1. At startup, `source/main.cpp` loads `/3ds/PhalkProfiles/play_data_db.json`. If it is missing, the database stays uninitialized; date corrections and other settings do not determine this state.
+2. On the first upload, the app reads PLD summaries and session records through `readActivityLog()` in `source/activity_log.cpp`. It then snapshots the PTM event history and saves the PTM cursor. This copies the PLD totals and intentionally skips PTM events already present before that checkpoint.
+3. On later uploads, `syncPlayDataFromPtm()` in `source/play_data.cpp` reads PTM and processes events after the saved cursor. It does not read PLD again.
+4. The app converts the in-memory database to the upload schema, applies saved date corrections to a temporary export copy, writes `export.json`, and uploads it. The corrections do not modify `play_data_db.json`.
+
+PTM changes are saved to the local database before JSON generation and upload. If a later export or upload step fails, those PTM events remain recorded locally and are not added again on the next run.
+
+Initialization reads PLD before it snapshots PTM. A session recorded in PTM between those two reads falls before the saved checkpoint and may not yet be included in PLD. Avoid launching or switching titles during first-time initialization; this small timing window is a known limitation of the current ordering.
+
+The upload JSON keeps the existing service schema: top-level export metadata and `users`, then each user's `titles`. Each title exports its hexadecimal `id`, display `name`, `platform`, and `summary` containing Unix timestamps for `firstPlayed` and `lastPlayed`, `playtime` in seconds, and `launches`. The database-only `latestSessionSeconds` and PTM cursor are not sent.
+
+### PTM event processing
+
+`readSnapshot()` opens the PTM Plays service and reads the circular play-history buffer in chunks of 256 events. The saved cursor consists of the next ring index, the last consumed index, and a signature derived from the last consumed event's title ID, minute timestamp, and event type. Before syncing, `cursorIsRetained()` checks that the prior event is still present and matches its signature. If the cursor has fallen out of the buffer or the ring position no longer matches, sync stops with a recovery message instead of silently skipping unknown history.
+
+`makeSessions()` pairs application launch/jump events with exit/leave events by Title ID. A global shutdown event (PTM event type 10 with an invalid Title ID) closes any sessions still active at shutdown. Sessions without a matching end are counted as incomplete and are not added to play time. PTM timestamps have minute precision, so reconstructed durations and dates use that precision. The current implementation does not persist an open session across syncs; a session whose start and end land on opposite sides of a saved cursor cannot be reconstructed from the new-event slice alone.
+
+When PTM history has wrapped past the cursor, the app asks the user to open Activity Log and reset the local database. Reset removes the PTM database; the next default upload seeds it again from the current PLD and establishes a fresh cursor. This recovery can only preserve history available in that PLD snapshot.
+
+### Local database format
+
+`PlayDataTitle` stores Title ID, cumulative play time in seconds, launch count, first- and last-played day numbers, and the latest session timestamp. The database also stores its format version, initialization flag, and PTM cursor. It is written as JSON to `/3ds/PhalkProfiles/play_data_db.json` through a temporary file.
+
+The loader accepts format 1 and format 2 databases and can migrate the older prototype file `ptm_test_db.json`. Migration writes the current format to `play_data_db.json` and leaves the old prototype file as a backup. A reset removes both files.
+
+### PLD path and code map
+
+The separate **Upload play data using Activity Log (PLD)** action reads and exports PLD directly. It retains the older flow, including PLD-derived recent-session date handling, and does not initialize or update the PTM database. `source/activity_log.cpp` reads the system save read-only; the app does not write to `pld.dat` or launch Activity Log.
+
+- `source/main.cpp`: menu, orchestration, date-correction UI, JSON schema, and upload.
+- `source/play_data.cpp` / `include/play_data.hpp`: PTM snapshot, session reconstruction, local database, migration, and cursor validation.
+- `source/activity_log.cpp` / `include/activity_log.hpp`: read-only PLD parser and local Title ID-to-name lookup.
+- `database.txt`: credentials and persisted date corrections; independent of the play-data database.
