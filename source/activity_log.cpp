@@ -1,6 +1,5 @@
 #include "activity_log.hpp"
 #include <nlohmann/json.hpp>
-#include <3ds/services/cfgu.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -72,7 +71,7 @@ std::string hexCode(Result code) {
 }
 
 // A successful archive open alone does not guarantee the save contains pld.dat.
-bool readSummaries(PldSummary* summaries, u16* latestSessionDays,
+bool readSummaries(PldSummary* summaries, u16* latestSessionDays, u32* latestSessionSeconds,
                    u16* latestFutureSessionDays, u32 todayDays, Result& lastError) {
     for (size_t i = 0; i < sizeof(kSaveIds) / sizeof(kSaveIds[0]); ++i) {
         const u32 pathData[2] = {MEDIATYPE_NAND, kSaveIds[i]};
@@ -99,6 +98,7 @@ bool readSummaries(PldSummary* summaries, u16* latestSessionDays,
                 std::map<u64, size_t> summaryById;
                 for (size_t j = 0; j < kSummaryCount; ++j) {
                     latestSessionDays[j] = 0;
+                    latestSessionSeconds[j] = 0;
                     latestFutureSessionDays[j] = 0;
                     if (summaries[j].id != 0 && summaries[j].id != ~u64(0))
                         summaryById[summaries[j].id] = j;
@@ -123,6 +123,9 @@ bool readSummaries(PldSummary* summaries, u16* latestSessionDays,
                         const std::map<u64, size_t>::const_iterator found = summaryById.find(session.id);
                         if (found == summaryById.end()) continue;
                         const u32 days = session.timestamp / 86400;
+                        const u32 sessionEnd = session.timestamp + session.playSeconds;
+                        if (sessionEnd > latestSessionSeconds[found->second])
+                            latestSessionSeconds[found->second] = sessionEnd;
                         if (days == 0 || days >= 0xFFFFu) continue;
                         u16* latest = days <= todayDays + 1
                             ? &latestSessionDays[found->second]
@@ -142,31 +145,15 @@ bool readSummaries(PldSummary* summaries, u16* latestSessionDays,
 
 } // namespace
 
-u64 activityLogTitleIdForSystemRegion() {
-    if (R_FAILED(cfguInit())) return 0;
-    u8 region = 0xFF;
-    const Result rc = CFGU_SecureInfoGetRegion(&region);
-    cfguExit();
-    if (R_FAILED(rc)) return 0;
-    switch (region) {
-        case CFG_REGION_JPN: return 0x0004001000020200ULL;
-        case CFG_REGION_USA: return 0x0004001000021200ULL;
-        case CFG_REGION_EUR:
-        case CFG_REGION_AUS: return 0x0004001000022200ULL;
-        case CFG_REGION_CHN: return 0x0004001000026200ULL;
-        case CFG_REGION_KOR: return 0x0004001000027200ULL;
-        case CFG_REGION_TWN: return 0x0004001000025200ULL;
-        default: return 0;
-    }
-}
-
 bool readActivityLog(std::vector<ActivityTitle>& titles, u32 todayDays, std::string& error) {
     titles.clear();
     PldSummary records[kSummaryCount];
     u16 latestSessionDays[kSummaryCount] = {};
+    u32 latestSessionSeconds[kSummaryCount] = {};
     u16 latestFutureSessionDays[kSummaryCount] = {};
     Result rc = static_cast<Result>(-1);
-    if (!readSummaries(records, latestSessionDays, latestFutureSessionDays, todayDays, rc)) {
+    if (!readSummaries(records, latestSessionDays, latestSessionSeconds,
+                       latestFutureSessionDays, todayDays, rc)) {
         error = "Could not read pld.dat (" + hexCode(rc) + "). Check CFW/Activity Log";
         return false;
     }
@@ -177,7 +164,8 @@ bool readActivityLog(std::vector<ActivityTitle>& titles, u32 todayDays, std::str
         if (s.totalSeconds == 0xFFFFFFFFu || (s.totalSeconds == 0 && s.launchCount == 0))
             continue;
         ActivityTitle entry = {s.id, s.totalSeconds, s.launchCount, s.firstDays, s.lastDays,
-                               latestSessionDays[i], latestFutureSessionDays[i]};
+                               latestSessionDays[i], latestFutureSessionDays[i],
+                               latestSessionSeconds[i]};
         titles.push_back(entry);
     }
     if (titles.empty()) {

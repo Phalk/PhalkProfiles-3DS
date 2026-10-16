@@ -1,5 +1,6 @@
 #include <3ds.h>
 #include "activity_log.hpp"
+#include "play_data.hpp"
 #include <nlohmann/json.hpp>
 
 #include <cstdio>
@@ -27,6 +28,8 @@ const char* const kEndpoint = "http://www.phalk.net/profiles/json_curl.php";
 
 void ensureDirectory();
 bool saveDatabase();
+
+PlayDataDatabase gPlayDataDatabase;
 
 void presentFrame() {
     gfxFlushBuffers();
@@ -107,16 +110,6 @@ bool currentActivityDay(u32& days, std::string& today) {
     days = activityDayNumber(year, month, local->tm_mday);
     today = calendarDate(year, month, local->tm_mday);
     return true;
-}
-
-std::string formatLastActivityLogUpdate() {
-    if (gDatabase.lastActivityLogUpdate == 0) return "unknown";
-    const std::time_t timestamp = static_cast<std::time_t>(gDatabase.lastActivityLogUpdate);
-    const std::tm* local = std::localtime(&timestamp);
-    if (!local) return "unknown";
-    char text[32];
-    if (std::strftime(text, sizeof(text), "%Y-%m-%d %H:%M", local) == 0) return "unknown";
-    return text;
 }
 
 bool futureDate(u16 days, u32 today) {
@@ -441,7 +434,8 @@ bool saveDatabase() {
     return true;
 }
 
-bool prepareExport(const std::vector<ActivityTitle>& records, unsigned int& count, std::string& error) {
+bool prepareExport(const std::vector<ActivityTitle>& records, unsigned int& count,
+                   std::string& error, const char* outputPath) {
     count = 0;
     json titles = json::array();
     for (const ActivityTitle& entry : records) {
@@ -477,11 +471,11 @@ bool prepareExport(const std::vector<ActivityTitle>& records, unsigned int& coun
     };
 
     ensureDirectory();
-    std::ofstream file(kExport, std::ios::binary | std::ios::trunc);
-    if (!file) { error = "Could not open export.json on SD"; return false; }
+    std::ofstream file(outputPath, std::ios::binary | std::ios::trunc);
+    if (!file) { error = "Could not open JSON output on SD"; return false; }
     file << output.dump(2) << '\n';
     file.flush();
-    if (!file.good()) { error = "Could not save export.json"; return false; }
+    if (!file.good()) { error = "Could not save JSON output"; return false; }
     count = static_cast<unsigned int>(titles.size());
     return true;
 }
@@ -499,7 +493,33 @@ bool prepareValidatedExport(unsigned int& count, std::string& error) {
     std::vector<ActivityTitle> records = original;
     applyDateCorrections(records, today);
     if (!reviewFutureDates(records, original, today, todayText, error)) return false;
-    return prepareExport(records, count, error);
+    return prepareExport(records, count, error, kExport);
+}
+
+bool prepareDatabaseExport(unsigned int& count, std::string& error) {
+    if (!gPlayDataDatabase.initialized) {
+        error = "The local play data database is not initialized";
+        return false;
+    }
+    u32 today = 0;
+    std::string todayText;
+    if (!currentActivityDay(today, todayText)) {
+        error = "Check the 3DS date and time";
+        return false;
+    }
+    std::vector<ActivityTitle> original;
+    original.reserve(gPlayDataDatabase.titles.size());
+    for (const auto& item : gPlayDataDatabase.titles) {
+        const PlayDataTitle& title = item.second;
+        const u16 launches = static_cast<u16>(std::min<u32>(title.launches, 0xFFFFu));
+        original.push_back({title.id, title.playtimeSeconds, launches,
+            title.firstPlayedDays, title.lastPlayedDays, 0, 0, title.latestSessionSeconds});
+    }
+    std::vector<ActivityTitle> records = original;
+    applyDateCorrections(records, today);
+    if (!reviewFutureDates(records, original, today, todayText, error)) return false;
+    ensureDirectory();
+    return prepareExport(records, count, error, kExport);
 }
 
 bool uploadExport(const Config& config, std::string& error) {
@@ -618,21 +638,52 @@ void draw(const Config& config, const std::string& status, int selected) {
     std::printf("--------------------------------\n\n");
     std::printf("Account: %.26s\n", config.username.empty() ? "(not set)" : config.username.c_str());
     std::printf("Password: %s\n", config.password.empty() ? "(not set)" : "********");
-    const std::string lastUpdate = formatLastActivityLogUpdate();
-    std::printf("Last update request: %s\n", lastUpdate.c_str());
-    std::printf("Recent sessions save when Activity Log opens.\n");
-    std::printf("Open it before uploading to include them.\n\n");
+    std::printf("Local play data: %s\n\n",
+        gPlayDataDatabase.initialized ? "initialized" : "will initialize from PLD");
 
-    const std::string updateAction = std::string("Update Activity Log (Last update: ") +
-        (gDatabase.lastActivityLogUpdate != 0 ? lastUpdate.substr(0, 10) : "unknown") + ")";
-    const std::string actions[] = {updateAction, "Create and upload", "Set username", "Set password", "Exit"};
-    for (int i = 0; i < 5; ++i)
+    const std::string actions[] = {
+        "Upload play data",
+        "Upload play data using Activity Log (PLD)",
+        "Set username",
+        "Set password",
+        "Reset local play data database",
+        "Exit"
+    };
+    for (int i = 0; i < 6; ++i)
         std::printf(" %c %s\n", i == selected ? '>' : ' ', actions[i].c_str());
     std::printf("\nStatus:\n");
     for (size_t start = 0; start < status.size() && start < 175; start += 35)
         std::printf("%.*s\n", 35, status.c_str() + start);
-    std::printf("\nSource: Activity Log (NAND)\n");
+    std::printf("\nPLD upload: open Activity Log first so it\n");
+    std::printf("can write recent play sessions to pld.dat.\n");
     std::printf("A: select  START: exit\n");
+}
+
+bool readCurrentPld(std::vector<ActivityTitle>& pld, std::string& error) {
+    u32 today = 0;
+    std::string todayText;
+    if (!currentActivityDay(today, todayText)) {
+        error = "Check the 3DS date and time";
+        return false;
+    }
+    return readActivityLog(pld, today, error);
+}
+
+bool confirmDatabaseReset() {
+    while (aptMainLoop()) {
+        consoleClear();
+        std::printf("RESET LOCAL PLAY DATA DATABASE?\n\n");
+        std::printf("The next upload will seed it from PLD.\n");
+        std::printf("Open Activity Log first to refresh PLD.\n\n");
+        std::printf("A: reset local database\n");
+        std::printf("B: keep existing data\n");
+        presentFrame();
+        hidScanInput();
+        const u32 down = hidKeysDown();
+        if (down & KEY_A) return true;
+        if (down & KEY_B) return false;
+    }
+    return false;
 }
 
 } // namespace
@@ -643,43 +694,85 @@ int main() {
     consoleInit(GFX_TOP, NULL);
     const Result fsResult = fsInit();
     const Result romfsResult = romfsInit();
+    if (R_SUCCEEDED(fsResult)) ensureDirectory();
     loadDatabase();
+    initializePlayDataDatabase(gPlayDataDatabase);
+    std::string playDataDatabaseError;
+    bool playDataDatabaseLoaded = loadPlayDataDatabase(gPlayDataDatabase, playDataDatabaseError);
     Config config = loadConfig();
     std::string status = R_FAILED(fsResult) ? "File system init failed"
-        : (R_SUCCEEDED(romfsResult) ? "Ready" : "Game database unavailable");
+        : (!playDataDatabaseLoaded ? playDataDatabaseError
+        : (R_SUCCEEDED(romfsResult) ? "Ready" : "Game database unavailable"));
     int selected = 0;
     bool dirty = true;
-    bool openActivityLog = false;
-    u64 activityLogTitleId = 0;
 
     while (aptMainLoop()) {
         hidScanInput();
         u32 down = hidKeysDown();
         if (down & KEY_START) break;
-        if (down & KEY_UP) { selected = (selected + 4) % 5; dirty = true; }
-        if (down & KEY_DOWN) { selected = (selected + 1) % 5; dirty = true; }
+        if (down & KEY_UP) { selected = (selected + 5) % 6; dirty = true; }
+        if (down & KEY_DOWN) { selected = (selected + 1) % 6; dirty = true; }
 
         if (down & KEY_A) {
-            if (selected == 4) break;
+            if (selected == 5) break;
             if (selected == 0) {
-                activityLogTitleId = activityLogTitleIdForSystemRegion();
-                const uint64_t previousUpdate = gDatabase.lastActivityLogUpdate;
-                const std::time_t now = std::time(NULL);
-                if (activityLogTitleId == 0) {
-                    status = "Could not identify the system region";
-                } else if (now == static_cast<std::time_t>(-1)) {
-                    status = "Could not read the console date and time";
+                if (!playDataDatabaseLoaded) {
+                    status = playDataDatabaseError;
+                } else if (R_FAILED(fsResult) || R_FAILED(romfsResult)) {
+                    status = R_FAILED(fsResult) ? "File system init failed" : "Game database unavailable";
                 } else {
-                    gDatabase.lastActivityLogUpdate = static_cast<uint64_t>(now);
-                    if (!saveDatabase()) {
-                        gDatabase.lastActivityLogUpdate = previousUpdate;
-                        status = "Could not save database.txt";
+                    std::string error;
+                    bool dataReady = false;
+                    if (!gPlayDataDatabase.initialized) {
+                        std::vector<ActivityTitle> pld;
+                        if (!readCurrentPld(pld, error)) {
+                            status = error;
+                        } else if (!initializePlayDataFromPld(gPlayDataDatabase, pld, error)) {
+                            status = error;
+                        } else {
+                            dataReady = true;
+                            status = "Local database initialized from PLD";
+                        }
+                    } else if (!syncPlayDataFromPtm(gPlayDataDatabase, error)) {
+                        status = error;
                     } else {
-                        status = "Opening Activity Log...";
+                        dataReady = true;
+                        status = "PTM data added to local database";
+                    }
+
+                    if (dataReady) {
+                        unsigned int count = 0;
+                        status += "; preparing JSON";
                         draw(config, status, selected);
                         presentFrame();
-                        openActivityLog = true;
-                        break;
+                        if (!prepareDatabaseExport(count, error)) {
+                            status = error;
+                        } else {
+                            status = "Uploading play data...";
+                            draw(config, status, selected);
+                            presentFrame();
+                            status = uploadExport(config, error)
+                                ? "Play data uploaded successfully" : error;
+                        }
+                    }
+                }
+            } else if (selected == 1) {
+                if (R_FAILED(fsResult) || R_FAILED(romfsResult)) {
+                    status = R_FAILED(fsResult) ? "File system init failed" : "Game database unavailable";
+                } else {
+                    unsigned int count = 0;
+                    std::string error;
+                    status = "Reading Activity Log (PLD)...";
+                    draw(config, status, selected);
+                    presentFrame();
+                    if (!prepareValidatedExport(count, error)) {
+                        status = error;
+                    } else {
+                        status = "Uploading PLD data...";
+                        draw(config, status, selected);
+                        presentFrame();
+                        status = uploadExport(config, error)
+                            ? "PLD play data uploaded successfully" : error;
                     }
                 }
             } else if (selected == 2 || selected == 3) {
@@ -689,30 +782,21 @@ int main() {
                     else config.password = value;
                     status = saveConfig(config) ? "Settings saved" : "Could not save settings";
                 }
-            } else {
-                unsigned int count = 0;
-                status = "Reading Activity Log...";
-                draw(config, status, selected);
-                presentFrame();
+            } else if (selected == 4) {
                 std::string error;
-                if (R_SUCCEEDED(fsResult) && R_SUCCEEDED(romfsResult) && prepareValidatedExport(count, error)) {
-                    status = "JSON created: " + std::to_string(count) + " titles";
-                    status = "Uploading via HTTP...";
-                    draw(config, status, selected);
-                    presentFrame();
-                    status = uploadExport(config, error) ? "Upload complete (HTTP 200)" : error;
-                } else {
-                    status = R_FAILED(fsResult) ? "File system init failed"
-                        : (R_FAILED(romfsResult) ? "Game database unavailable" : error);
-                }
+                if (confirmDatabaseReset() && resetPlayDataDatabase(error)) {
+                    initializePlayDataDatabase(gPlayDataDatabase);
+                    status = "Local database reset; next upload initializes from PLD";
+                    playDataDatabaseLoaded = true;
+                } else if (error.empty()) {
+                    status = "Database reset cancelled";
+                } else status = error;
             }
             dirty = true;
         }
         if (dirty) { draw(config, status, selected); dirty = false; }
         presentFrame();
     }
-    if (openActivityLog)
-        aptSetChainloader(activityLogTitleId, MEDIATYPE_NAND);
     if (R_SUCCEEDED(romfsResult)) romfsExit();
     if (R_SUCCEEDED(fsResult)) fsExit();
     gfxExit();
